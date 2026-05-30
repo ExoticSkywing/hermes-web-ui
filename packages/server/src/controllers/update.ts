@@ -1,17 +1,21 @@
 import { execFileSync, spawn, type ChildProcess } from 'child_process'
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { createServer } from 'net'
-import { delimiter, dirname, join, resolve } from 'path'
+import { delimiter, dirname, extname, join, resolve } from 'path'
 import { getWebUiHome } from '../config'
 
 let updateInProgress = false
 let previewProcess: ChildProcess | null = null
+const NODE_ENVIRONMENT_MISSING_CODE = 'node_environment_missing'
 
 const PREVIEW_DIR_NAME = 'hermes-web-ui-pereview'
 const PREVIEW_HOME_DIR_NAME = 'hermes-web-ui-pereview-home'
 const PREVIEW_BACKEND_PORT = 8650
 const PREVIEW_FRONTEND_PORT = 8651
 const PREVIEW_AGENT_BRIDGE_PORT = 18650
+const PREVIEW_AGENT_BRIDGE_WORKER_PORT_BASE = 19650
+const PREVIEW_AGENT_BRIDGE_ENDPOINT_ENV = 'HERMES_WEB_UI_PREVIEW_AGENT_BRIDGE_ENDPOINT'
+const PREVIEW_AGENT_BRIDGE_TRANSPORT_ENV = 'HERMES_WEB_UI_PREVIEW_AGENT_BRIDGE_TRANSPORT'
 const PREVIEW_FRONTEND_URL = `http://localhost:${PREVIEW_FRONTEND_PORT}`
 const PREVIEW_TAG_REF_PATTERN = /^[A-Za-z0-9._/-]+$/
 const PREVIEW_MAIN_REF = 'main'
@@ -141,6 +145,106 @@ function getNpmBin() {
   return process.platform === 'win32' ? 'npm.cmd' : 'npm'
 }
 
+function windowsCommandNeedsShell(command: string): boolean {
+  const extension = extname(command).toLowerCase()
+  return extension === '.cmd' || extension === '.bat'
+}
+
+function commandExecution(command: string, args: string[]): { command: string; args: string[] } {
+  if (process.platform === 'win32' && windowsCommandNeedsShell(command)) {
+    const commandArg = / /.test(command) ? `"${command}"` : command
+    const argsString = args.map(arg => / /.test(arg) ? `"${arg}"` : arg).join(' ')
+    return {
+      command: 'cmd.exe',
+      args: ['/d', '/s', '/c', `${commandArg} ${argsString}`],
+    }
+  }
+  return { command, args }
+}
+
+function nodeEnvironmentMissingError(): Error {
+  const err = new Error('Node/npm environment was not detected. Please install Node.js and try again.')
+  ;(err as any).code = NODE_ENVIRONMENT_MISSING_CODE
+  return err
+}
+
+function isNodeEnvironmentMissingError(err: any): boolean {
+  const text = [
+    err?.code,
+    err?.message,
+    err?.stderr?.toString?.(),
+    err?.stdout?.toString?.(),
+  ].filter(Boolean).join('\n').toLowerCase()
+  return text.includes('enoent') ||
+    text.includes('spawn npm') ||
+    text.includes('npm: command not found') ||
+    text.includes('npm not found') ||
+    text.includes('node: command not found') ||
+    text.includes('node not found')
+}
+
+function normalizeNodeToolError(err: any): { message: string; code?: string } {
+  if (isNodeEnvironmentMissingError(err)) {
+    return { message: nodeEnvironmentMissingError().message, code: NODE_ENVIRONMENT_MISSING_CODE }
+  }
+  return { message: err?.stderr?.toString() || err?.message || String(err) }
+}
+
+function findCommandPath(command: string, env: NodeJS.ProcessEnv): string | null {
+  try {
+    const lookupCommand = process.platform === 'win32' ? 'where' : 'which'
+    const stdout = execFileSync(lookupCommand, [command], {
+      encoding: 'utf-8',
+      timeout: 3000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env,
+      windowsHide: true,
+    })
+    return stdout.split(/\r?\n/).map((line: string) => line.trim()).find(Boolean) || null
+  } catch {
+    return null
+  }
+}
+
+function npmCliFromNpmBin(npmBin: string): { node: string; npmCli: string } | null {
+  const binDir = dirname(npmBin)
+  if (process.platform === 'win32') {
+    const node = join(binDir, 'node.exe')
+    const npmCli = join(binDir, 'node_modules', 'npm', 'bin', 'npm-cli.js')
+    return existsSync(node) && existsSync(npmCli) ? { node, npmCli } : null
+  }
+
+  const node = join(binDir, 'node')
+  const npmCli = join(dirname(binDir), 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js')
+  return existsSync(node) && existsSync(npmCli) ? { node, npmCli } : null
+}
+
+function npmExecution(args: string[], env: NodeJS.ProcessEnv): { command: string; args: string[] } {
+  const bundledNpmCli = getNpmCliPath()
+  if (bundledNpmCli) return { command: process.execPath, args: [bundledNpmCli, ...args] }
+
+  const npmBin = findCommandPath(getNpmBin(), env) || findCommandPath('npm', env)
+  if (!npmBin) throw nodeEnvironmentMissingError()
+
+  const npmCli = npmCliFromNpmBin(npmBin)
+  if (npmCli) return { command: npmCli.node, args: [npmCli.npmCli, ...args] }
+
+  const nodeBin = findCommandPath(process.platform === 'win32' ? 'node.exe' : 'node', env) || findCommandPath('node', env)
+  if (!nodeBin) throw nodeEnvironmentMissingError()
+
+  return commandExecution(npmBin, args)
+}
+
+function isTermuxRuntime() {
+  const prefix = process.env.PREFIX || ''
+  return prefix.includes('/com.termux/') ||
+    existsSync('/data/data/com.termux/files/usr')
+}
+
+function getPreviewViteHostArg() {
+  return isTermuxRuntime() ? '127.0.0.1' : ''
+}
+
 function getGlobalPackageBin(root: string) {
   return join(root, 'hermes-web-ui', 'bin', 'hermes-web-ui.mjs')
 }
@@ -154,21 +258,20 @@ function getCurrentNodeEnv() {
 }
 
 function runNpm(args: string[], options: { timeout?: number; cwd?: string; logLabel?: string; env?: NodeJS.ProcessEnv } = {}) {
-  const npmCli = getNpmCliPath()
-  const command = npmCli ? process.execPath : getNpmBin()
-  const commandArgs = npmCli ? [npmCli, ...args] : args
+  const env = {
+    ...getCurrentNodeEnv(),
+    ...options.env,
+  }
+  const execution = npmExecution(args, env)
   const label = options.logLabel || ''
 
-  if (label) appendPreviewActionLog(`${label}: ${command} ${commandArgs.join(' ')}${options.cwd ? `\ncwd: ${options.cwd}` : ''}`)
+  if (label) appendPreviewActionLog(`${label}: ${execution.command} ${execution.args.join(' ')}${options.cwd ? `\ncwd: ${options.cwd}` : ''}`)
   try {
-    const output = execFileSync(command, commandArgs, {
+    const output = execFileSync(execution.command, execution.args, {
       encoding: 'utf-8',
       timeout: options.timeout,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...getCurrentNodeEnv(),
-        ...options.env,
-      },
+      env,
       cwd: options.cwd,
       windowsHide: true,
     }).trim()
@@ -197,10 +300,41 @@ function getPreviewHomeDir() {
   return join(getWebUiHome(), PREVIEW_HOME_DIR_NAME)
 }
 
+function normalizePreviewAgentBridgeTransport(value: string | undefined) {
+  const transport = value?.trim().toLowerCase()
+  return transport && ['tcp', 'ipc', 'unix'].includes(transport) ? transport : ''
+}
+
 function getPreviewAgentBridgeEndpoint() {
-  return process.platform === 'win32'
+  const configured = process.env[PREVIEW_AGENT_BRIDGE_ENDPOINT_ENV]?.trim()
+  if (configured) return configured
+
+  const transport = normalizePreviewAgentBridgeTransport(process.env[PREVIEW_AGENT_BRIDGE_TRANSPORT_ENV])
+    || normalizePreviewAgentBridgeTransport(process.env.HERMES_AGENT_BRIDGE_WORKER_TRANSPORT)
+  const useTcp = transport ? transport === 'tcp' : process.platform === 'win32'
+  return useTcp
     ? `tcp://127.0.0.1:${PREVIEW_AGENT_BRIDGE_PORT}`
     : `ipc://${join(getPreviewHomeDir(), 'agent-bridge.sock')}`
+}
+
+function getTcpEndpointPort(endpoint: string): number | null {
+  try {
+    const url = new URL(endpoint)
+    if (url.protocol !== 'tcp:') return null
+    const port = Number(url.port)
+    return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null
+  } catch {
+    return null
+  }
+}
+
+function getPreviewListeningPorts() {
+  const agentBridgePort = getTcpEndpointPort(getPreviewAgentBridgeEndpoint())
+  return [
+    PREVIEW_BACKEND_PORT,
+    PREVIEW_FRONTEND_PORT,
+    ...(agentBridgePort ? [agentBridgePort] : []),
+  ]
 }
 
 function getPreviewPackagePath() {
@@ -261,7 +395,8 @@ function getPreviewStatus() {
   const exists = existsSync(previewDir)
   const hasPackage = existsSync(packagePath)
   const installed = hasPackage && getMissingPreviewDependencyBins().length === 0
-  const running = Boolean(previewProcess?.pid && !previewProcess.killed)
+  const runtimePids = getPreviewListeningPids()
+  const running = Boolean(previewProcess?.pid && !previewProcess.killed) || runtimePids.length > 0
   const currentTag = getCurrentPreviewTag()
 
   return {
@@ -270,7 +405,7 @@ function getPreviewStatus() {
     has_package: hasPackage,
     installed,
     running,
-    pid: running ? previewProcess?.pid : null,
+    pid: running ? previewProcess?.pid || runtimePids[0] || null : null,
     current_tag: currentTag,
     frontend_url: PREVIEW_FRONTEND_URL,
     agent_bridge_endpoint: getPreviewAgentBridgeEndpoint(),
@@ -296,12 +431,63 @@ function isPortAvailable(port: number): Promise<boolean> {
   })
 }
 
+function parsePidLines(output: string): number[] {
+  return [...new Set(output
+    .split(/\r?\n/)
+    .map(line => Number(line.trim()))
+    .filter(pid => Number.isFinite(pid) && pid > 0))]
+}
+
+function getPreviewListeningPids(): number[] {
+  const ports = getPreviewListeningPorts()
+  const pids = new Set<number>()
+
+  if (process.platform === 'win32') {
+    try {
+      const output = execFileSync('netstat.exe', ['-ano', '-p', 'tcp'], { encoding: 'utf-8', windowsHide: true })
+      for (const line of output.split(/\r?\n/)) {
+        const parts = line.trim().split(/\s+/)
+        if (parts.length < 5) continue
+        const [proto, localAddress, , state, pidRaw] = parts
+        if (proto.toUpperCase() !== 'TCP' || state.toUpperCase() !== 'LISTENING') continue
+        const listenPort = Number(localAddress.split(':').pop())
+        if (!ports.includes(listenPort)) continue
+        const pid = Number(pidRaw)
+        if (Number.isFinite(pid) && pid > 0) pids.add(pid)
+      }
+    } catch {}
+    return [...pids]
+  }
+
+  for (const port of ports) {
+    try {
+      for (const pid of parsePidLines(execFileSync('lsof', [`-tiTCP:${port}`, '-sTCP:LISTEN'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }))) {
+        pids.add(pid)
+      }
+    } catch {}
+  }
+
+  return [...pids]
+}
+
+function getUnixProcessGroupId(pid: number): number | null {
+  try {
+    const output = execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    const pgid = Number(output)
+    return Number.isFinite(pgid) && pgid > 0 ? pgid : null
+  } catch {
+    return null
+  }
+}
+
 async function assertPreviewPortsAvailable() {
-  const ports = [
-    PREVIEW_BACKEND_PORT,
-    PREVIEW_FRONTEND_PORT,
-    ...(process.platform === 'win32' ? [PREVIEW_AGENT_BRIDGE_PORT] : []),
-  ]
+  const ports = getPreviewListeningPorts()
   const checks = await Promise.all(ports.map(port => isPortAvailable(port)))
   const busy = ports.filter((_, index) => !checks[index])
 
@@ -343,28 +529,50 @@ function openPreviewLogFile() {
 
 async function stopPreviewProcess() {
   const child = previewProcess
-  if (!child?.pid || child.killed) {
+  const pids = new Set<number>()
+  if (child?.pid && !child.killed) pids.add(child.pid)
+  for (const pid of getPreviewListeningPids()) pids.add(pid)
+
+  if (!pids.size) {
     previewProcess = null
     return
   }
 
-  appendPreviewActionLog(`stopping preview process pid=${child.pid}`)
-  try {
-    if (process.platform === 'win32') {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
-    } else {
+  appendPreviewActionLog(`stopping preview process pid(s)=${[...pids].join(', ')}`)
+  if (process.platform === 'win32') {
+    for (const pid of pids) {
       try {
-        process.kill(-child.pid, 'SIGTERM')
+        execFileSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+      } catch {}
+    }
+  } else {
+    const pgids = new Set<number>()
+    for (const pid of pids) {
+      const pgid = getUnixProcessGroupId(pid)
+      if (pgid) pgids.add(pgid)
+      else pgids.add(pid)
+    }
+    for (const pgid of pgids) {
+      try {
+        process.kill(-pgid, 'SIGTERM')
       } catch {
-        child.kill('SIGTERM')
+        try { process.kill(pgid, 'SIGTERM') } catch {}
       }
     }
-  } catch {
-    child.kill()
+    await sleep(800)
+    const remainingPids = getPreviewListeningPids()
+    const remainingPgids = new Set(remainingPids.map(getUnixProcessGroupId).filter((pgid): pgid is number => Boolean(pgid)))
+    for (const pgid of remainingPgids) {
+      try { process.kill(-pgid, 'SIGKILL') } catch {}
+    }
   }
 
   previewProcess = null
   await sleep(800)
+}
+
+export async function stopPreviewRuntime(): Promise<void> {
+  await stopPreviewProcess()
 }
 
 function assertPreviewPackage() {
@@ -482,9 +690,12 @@ function applyPreviewRuntimePatch() {
 
   if (existsSync(packagePath)) {
     const pkg = JSON.parse(readFileSync(packagePath, 'utf-8'))
+    const hostArg = getPreviewViteHostArg()
     pkg.scripts = {
       ...pkg.scripts,
-      'dev:client': `vite --host --port ${PREVIEW_FRONTEND_PORT} --strictPort`,
+      'dev:client': hostArg
+        ? `vite --host ${hostArg} --port ${PREVIEW_FRONTEND_PORT} --strictPort`
+        : `vite --host --port ${PREVIEW_FRONTEND_PORT} --strictPort`,
     }
     writeFileSync(packagePath, JSON.stringify(pkg, null, 2) + '\n', 'utf-8')
   }
@@ -810,9 +1021,10 @@ export async function installPreview(ctx: any) {
     }
     ctx.body = previewPayload({ success: true, message: output })
   } catch (err: any) {
-    appendPreviewActionLog(`npm install failed: ${err.stderr?.toString() || err.message || String(err)}`)
+    const normalized = normalizeNodeToolError(err)
+    appendPreviewActionLog(`npm install failed: ${normalized.message}`)
     ctx.status = 500
-    ctx.body = previewPayload({ success: false, message: err.stderr?.toString() || err.message || String(err) })
+    ctx.body = previewPayload({ success: false, message: normalized.message, code: normalized.code })
   }
 }
 
@@ -852,28 +1064,28 @@ export async function startPreview(ctx: any) {
 
     await assertPreviewPortsAvailable()
 
-    const npmCli = getNpmCliPath()
-    const command = npmCli ? process.execPath : getNpmBin()
-    const commandArgs = npmCli ? [npmCli, 'run', 'dev'] : ['run', 'dev']
+    const env = {
+      ...getCurrentNodeEnv(),
+      NODE_ENV: 'development',
+      PORT: String(PREVIEW_BACKEND_PORT),
+      HERMES_WEB_UI_HOME: getPreviewHomeDir(),
+      HERMES_WEBUI_STATE_DIR: getPreviewHomeDir(),
+      HERMES_AGENT_BRIDGE_ENDPOINT: getPreviewAgentBridgeEndpoint(),
+      HERMES_AGENT_BRIDGE_WORKER_PORT_BASE: String(PREVIEW_AGENT_BRIDGE_WORKER_PORT_BASE),
+      AUTH_TOKEN: '',
+      HERMES_WEB_UI_BACKEND_PORT: String(PREVIEW_BACKEND_PORT),
+      HERMES_WEB_UI_FRONTEND_PORT: String(PREVIEW_FRONTEND_PORT),
+      VITE_HERMES_PREVIEW: '1',
+    }
+    const execution = npmExecution(['run', 'dev'], env)
     const logFd = openPreviewLogFile()
-    appendPreviewActionLog(`spawn preview process: ${command} ${commandArgs.join(' ')}`)
-    previewProcess = spawn(command, commandArgs, {
+    appendPreviewActionLog(`spawn preview process: ${execution.command} ${execution.args.join(' ')}`)
+    previewProcess = spawn(execution.command, execution.args, {
       cwd: getPreviewDir(),
       detached: true,
       stdio: ['ignore', logFd, logFd],
       windowsHide: true,
-      env: {
-        ...getCurrentNodeEnv(),
-        NODE_ENV: 'development',
-        PORT: String(PREVIEW_BACKEND_PORT),
-        HERMES_WEB_UI_HOME: getPreviewHomeDir(),
-        HERMES_WEBUI_STATE_DIR: getPreviewHomeDir(),
-        HERMES_AGENT_BRIDGE_ENDPOINT: getPreviewAgentBridgeEndpoint(),
-        AUTH_TOKEN: '',
-        HERMES_WEB_UI_BACKEND_PORT: String(PREVIEW_BACKEND_PORT),
-        HERMES_WEB_UI_FRONTEND_PORT: String(PREVIEW_FRONTEND_PORT),
-        VITE_HERMES_PREVIEW: '1',
-      },
+      env,
     })
     closeSync(logFd)
     previewProcess.on('exit', () => {
@@ -891,9 +1103,11 @@ export async function startPreview(ctx: any) {
     appendPreviewActionLog(`preview ready: ${PREVIEW_FRONTEND_URL}`)
     ctx.body = previewPayload({ success: true, message: 'Preview started' })
   } catch (err: any) {
-    appendPreviewActionLog(`npm run dev failed: ${err.stderr?.toString() || err.message || String(err)}`)
+    const normalized = normalizeNodeToolError(err)
+    appendPreviewActionLog(`npm run dev failed: ${normalized.message}`)
+    await stopPreviewProcess()
     ctx.status = 500
-    ctx.body = previewPayload({ success: false, message: err.message || String(err) })
+    ctx.body = previewPayload({ success: false, message: normalized.message, code: normalized.code })
   }
 }
 
